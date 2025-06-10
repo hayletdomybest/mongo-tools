@@ -1,8 +1,9 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -41,7 +42,6 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error reading directory: %v", err)
 		}
-
 		for _, file := range files {
 			processFile(db, file)
 		}
@@ -59,13 +59,13 @@ func loadEnv() {
 }
 
 func processFile(db *mongo.Database, filePath string) {
-	collectionName := extractCollectionName(filePath)
-	if collectionName == "" {
+	coll := extractCollectionName(filePath)
+	if coll == "" {
 		log.Printf("⚠️  Skipping unrecognized file: %s\n", filePath)
 		return
 	}
 
-	fmt.Printf("📥 Importing %s → collection: %s\n", filepath.Base(filePath), collectionName)
+	fmt.Printf("📥 Importing %s → collection: %s\n", filepath.Base(filePath), coll)
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -73,20 +73,9 @@ func processFile(db *mongo.Database, filePath string) {
 		return
 	}
 
-	var raw interface{}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		log.Printf("❌ JSON parse error: %s\n", filePath)
-		return
-	}
-
-	var docs []interface{}
-	switch v := raw.(type) {
-	case []interface{}:
-		docs = v
-	case map[string]interface{}:
-		docs = append(docs, v)
-	default:
-		log.Printf("❌ Unknown JSON structure in file: %s\n", filePath)
+	docs, err := parseExtendedJSON(data)
+	if err != nil {
+		log.Printf("❌ Failed to parse Extended JSON in %s: %v\n", filePath, err)
 		return
 	}
 
@@ -94,30 +83,69 @@ func processFile(db *mongo.Database, filePath string) {
 	defer cancel()
 
 	// 清空舊資料
-	if _, err := db.Collection(collectionName).DeleteMany(ctx, bson.M{}); err != nil {
-		log.Printf("❌ Failed to clear collection %s: %v\n", collectionName, err)
+	if _, err := db.Collection(coll).DeleteMany(ctx, bson.M{}); err != nil {
+		log.Printf("❌ Failed to clear collection %s: %v\n", coll, err)
 		return
 	}
 
 	// 插入新資料
-	if _, err := db.Collection(collectionName).InsertMany(ctx, docs); err != nil {
-		log.Printf("❌ Failed to insert into %s: %v\n", collectionName, err)
+	if _, err := db.Collection(coll).InsertMany(ctx, docs); err != nil {
+		log.Printf("❌ Failed to insert into %s: %v\n", coll, err)
 	} else {
-		fmt.Printf("✅ Inserted %d docs into %s\n", len(docs), collectionName)
+		fmt.Printf("✅ Inserted %d docs into %s\n", len(docs), coll)
 	}
 }
 
-func extractCollectionName(filePath string) string {
-	filename := filepath.Base(filePath)
-	if !strings.HasSuffix(filename, ".json") {
-		return ""
+// parseExtendedJSON 支援 整份 JSON Array 或 NDJSON，每笔都用 relaxed 模式解析 Extended JSON
+func parseExtendedJSON(data []byte) ([]interface{}, error) {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
+		return nil, nil
 	}
 
-	parts := strings.Split(filename, ".")
+	var docs []interface{}
+
+	// 整份 JSON Array
+	if data[0] == '[' {
+		var arr []bson.M
+		// <--- relaxed 模式：false
+		if err := bson.UnmarshalExtJSON(data, false, &arr); err != nil {
+			return nil, fmt.Errorf("failed to parse JSON array: %v", err)
+		}
+		for _, m := range arr {
+			docs = append(docs, m)
+		}
+		return docs, nil
+	}
+
+	// 否则当作 NDJSON（每行一笔）
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var m bson.M
+		// <--- relaxed 模式：false
+		if err := bson.UnmarshalExtJSON([]byte(line), false, &m); err != nil {
+			return nil, fmt.Errorf("failed to parse line as Extended JSON: %v", err)
+		}
+		docs = append(docs, m)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return docs, nil
+}
+
+func extractCollectionName(filePath string) string {
+	name := filepath.Base(filePath)
+	if !strings.HasSuffix(name, ".json") {
+		return ""
+	}
+	parts := strings.Split(name, ".")
 	if len(parts) < 2 {
 		return ""
 	}
-
-	// Use last part before ".json" as collection name
 	return parts[len(parts)-2]
 }
